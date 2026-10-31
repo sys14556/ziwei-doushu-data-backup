@@ -1,0 +1,178 @@
+name: Deploy Complete Ziwei Dataset to Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ziwei-pages-full-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Check out the backup repository
+        uses: actions/checkout@v4
+
+      - name: Install zstd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+
+      - name: Download all 77 archived year files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p archive
+          gh release download v4.0-13d-backup \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'year-*.jsonl.zst' \
+            --dir archive
+          echo "Downloaded $(find archive -maxdepth 1 -name 'year-*.jsonl.zst' | wc -l) year files"
+
+      - name: Make and validate all monthly files
+        run: |
+          python3 - <<'PY'
+          import calendar
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          start, end = 1950, 2026
+          archive = Path('archive')
+          public = Path('public')
+          data_dir = public / 'data'
+          staging = Path('working')
+          data_dir.mkdir(parents=True, exist_ok=True)
+          staging.mkdir(exist_ok=True)
+
+          expected_inputs = {f'year-{year}.jsonl.zst' for year in range(start, end + 1)}
+          actual_inputs = {path.name for path in archive.glob('year-*.jsonl.zst')}
+          if actual_inputs != expected_inputs:
+              missing = sorted(expected_inputs - actual_inputs)
+              extra = sorted(actual_inputs - expected_inputs)
+              raise RuntimeError(f'Incorrect archive set; missing={missing}, extra={extra}')
+
+          manifest = {
+              'dataset': 'Ziwei interpretation v4.0-13d',
+              'source': 'https://github.com/Renhuai123/ziwei-doushu/releases/tag/v4.0-13d',
+              'years': [start, end],
+              'compression': 'zstd',
+              'months': [],
+          }
+          total_charts = 0
+          for year in range(start, end + 1):
+              source = archive / f'year-{year}.jsonl.zst'
+              monthly_paths = {m: staging / f'{year}-{m:02d}.jsonl' for m in range(1, 13)}
+              writers = {m: path.open('w', encoding='utf-8', newline='\n')
+                         for m, path in monthly_paths.items()}
+              counts = {m: 0 for m in range(1, 13)}
+              keys = set()
+              try:
+                  with subprocess.Popen(
+                      ['zstd', '-dc', '--long=27', str(source)],
+                      stdout=subprocess.PIPE,
+                      text=True,
+                      encoding='utf-8',
+                  ) as process:
+                      for line in process.stdout:
+                          record = json.loads(line)
+                          if int(record['y']) != year:
+                              raise ValueError(f'Unexpected year in {source}: {record.get("y")}')
+                          month = int(record['m'])
+                          if month not in writers:
+                              raise ValueError(f'Invalid month in {source}: {month}')
+                          if not isinstance(record.get('c'), dict) or len(record['c']) != 13:
+                              raise ValueError(f'Expected 13 topics: {record.get("k")}')
+                          key = record['k']
+                          if key in keys:
+                              raise ValueError(f'Duplicate key within year: {key}')
+                          keys.add(key)
+                          writers[month].write(line)
+                          counts[month] += 1
+                      if process.wait() != 0:
+                          raise RuntimeError(f'Decompression failed: {source}')
+              finally:
+                  for output in writers.values():
+                      output.close()
+
+              for month in range(1, 13):
+                  expected_count = calendar.monthrange(year, month)[1] * 12 * 2
+                  if counts[month] != expected_count:
+                      raise ValueError(
+                          f'Incorrect chart count {year}-{month:02d}: '
+                          f'{counts[month]} != {expected_count}'
+                      )
+                  name = f'{year}-{month:02d}'
+                  output = data_dir / f'{name}.jsonl.zst'
+                  subprocess.run(
+                      ['zstd', '-q', '-f', '-15', str(monthly_paths[month]), '-o', str(output)],
+                      check=True,
+                  )
+                  monthly_paths[month].unlink()
+                  size = output.stat().st_size
+                  if size > 25 * 1024 * 1024:
+                      raise ValueError(f'Asset exceeds Pages 25 MiB limit: {output} ({size} bytes)')
+                  checksum = hashlib.sha256(output.read_bytes()).hexdigest()
+                  meta = {
+                      'year': year,
+                      'month': month,
+                      'charts': counts[month],
+                      'bytes': size,
+                      'compression': 'zstd',
+                      'sha256': checksum,
+                  }
+                  (data_dir / f'{name}.meta.json').write_text(
+                      json.dumps(meta, ensure_ascii=False, separators=(',', ':')),
+                      encoding='utf-8',
+                  )
+                  manifest['months'].append(meta)
+                  total_charts += counts[month]
+
+              print(f'Completed {year}: {sum(counts.values())} charts', flush=True)
+              source.unlink()  # Reclaim runner disk space.
+
+          if total_charts != 674976 or len(manifest['months']) != 924:
+              raise ValueError(
+                  f'Unexpected totals: {total_charts} charts / {len(manifest["months"])} months'
+              )
+          manifest['total_charts'] = total_charts
+          manifest['total_months'] = len(manifest['months'])
+          (data_dir / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, separators=(',', ':')),
+              encoding='utf-8',
+          )
+          (public / 'index.html').write_text(
+              '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+              '<title>紫微斗数数据服务</title><body><h1>紫微斗数数据服务</h1>'
+              '<p>1950–2026 年命盘数据文件。</p>'
+              '<p><a href="/data/manifest.json">数据索引</a></p>'
+              '<p>Source: <a href="https://github.com/Renhuai123/ziwei-doushu/releases/tag/v4.0-13d">'
+              'Ziwei interpretation v4.0</a>. Please respect the original licensing and quotation restrictions.</p>'
+              '</body></html>',
+              encoding='utf-8',
+          )
+          (public / '_headers').write_text(
+              '/data/*\n'
+              '  Access-Control-Allow-Origin: *\n'
+              '  Cache-Control: public, max-age=3600\n',
+              encoding='utf-8',
+          )
+          expected_files = 924 * 2 + 1
+          actual_files = len(list(data_dir.iterdir()))
+          if actual_files != expected_files:
+              raise RuntimeError(f'Incomplete deployment folder: {actual_files} != {expected_files}')
+          print(f'VALIDATED {total_charts} charts in 924 monthly blocks; {actual_files} data files')
+          PY
+
+      - name: Deploy the entire dataset as one Pages version
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy public --project-name=ziwei-dataset --branch=main
