@@ -1,0 +1,179 @@
+
+name: Test Ziwei Gzip Storage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gzip-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          gh release download v4.0-13d-backup \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "year-1998.jsonl.zst" \
+            --dir .
+
+      - name: Test gzip dictionary and index
+        run: |
+          python3 - <<'PY'
+          import json
+          import gzip
+          import hashlib
+          import os
+          import subprocess
+          from collections import defaultdict
+
+          catalogs = defaultdict(dict)
+          texts = defaultdict(list)
+          monthly = defaultdict(list)
+          checksums = {}
+
+          def encode(obj):
+              return json.dumps(
+                  obj,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":")
+              ).encode("utf-8")
+
+          process = subprocess.Popen(
+              ["zstd", "-dc", "year-1998.jsonl.zst"],
+              stdout=subprocess.PIPE,
+              text=True,
+              encoding="utf-8"
+          )
+
+          count = 0
+
+          for line in process.stdout:
+              item = json.loads(line)
+              key = item["k"]
+              refs = {}
+
+              if key in checksums:
+                  raise ValueError("Duplicate chart key")
+
+              checksums[key] = hashlib.sha256(
+                  encode(item["c"])
+              ).digest()
+
+              for topic, content in item["c"].items():
+                  if content not in catalogs[topic]:
+                      index = len(texts[topic])
+                      catalogs[topic][content] = index
+                      texts[topic].append(content)
+
+                  refs[topic] = catalogs[topic][content]
+
+              compact = {
+                  k: v for k, v in item.items()
+                  if k != "c"
+              }
+              compact["r"] = refs
+
+              monthly[int(item["m"])].append(compact)
+              count += 1
+
+          if process.wait() != 0:
+              raise RuntimeError("zstd extraction failed")
+
+          if count != 8760:
+              raise ValueError(
+                  f"Unexpected chart count: {count}"
+              )
+
+          # Verify all 8760 charts can be reconstructed.
+          verified = 0
+
+          for rows in monthly.values():
+              for item in rows:
+                  restored = {
+                      topic: texts[topic][idx]
+                      for topic, idx in item["r"].items()
+                  }
+                  digest = hashlib.sha256(
+                      encode(restored)
+                  ).digest()
+
+                  if digest != checksums[item["k"]]:
+                      raise ValueError(
+                          "Round-trip failed: " + item["k"]
+                      )
+                  verified += 1
+
+          dictionary_bytes = []
+          index_bytes = []
+
+          for topic, values in texts.items():
+              raw = encode(values)
+              compressed = gzip.compress(
+                  raw, compresslevel=9, mtime=0
+              )
+              dictionary_bytes.append(
+                  (topic, len(raw), len(compressed))
+              )
+
+          for month, rows in monthly.items():
+              raw = encode(rows)
+              compressed = gzip.compress(
+                  raw, compresslevel=9, mtime=0
+              )
+              index_bytes.append(
+                  (month, len(raw), len(compressed))
+              )
+
+          all_values = dictionary_bytes + index_bytes
+          total = sum(x[2] for x in all_values)
+          largest = max(x[2] for x in all_values)
+          limit = 25 * 1024 * 1024
+
+          mb = lambda n: f"{n / 1048576:.2f}"
+
+          report = [
+              "# Ziwei 1998 Gzip Storage Report",
+              "",
+              f"Charts: {count}",
+              f"Topics: {len(texts)}",
+              f"Verified charts: {verified}",
+              "Round-trip: PASS",
+              "",
+              f"Dictionary gzip: {mb(sum(x[2] for x in dictionary_bytes))} MB",
+              f"Monthly index gzip: {mb(sum(x[2] for x in index_bytes))} MB",
+              f"Combined gzip: {mb(total)} MB",
+              f"Largest compressed value: {mb(largest)} MB",
+              f"Largest value under 25 MiB: {largest <= limit}",
+              f"77-year linear estimate: {mb(total * 77)} MB",
+              "",
+              "| Topic | Unique texts | gzip MB |",
+              "|---|---:|---:|"
+          ]
+
+          for topic, raw, size in sorted(dictionary_bytes):
+              report.append(
+                  f"| {topic} | {len(texts[topic])} | {mb(size)} |"
+              )
+
+          report += [
+              "",
+              "No Cloudflare KV data was modified."
+          ]
+
+          output = "\n".join(report)
+          print(output)
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a", encoding="utf-8"
+          ) as file:
+              file.write(output + "\n")
+          PY
