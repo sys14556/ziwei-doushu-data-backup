@@ -1,0 +1,169 @@
+
+name: Test Ziwei Deduplication
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dedup-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download 1998 dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          gh release download v4.0-13d-backup \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "year-1998.jsonl.zst" \
+            --dir .
+
+      - name: Analyze duplicated readings
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from collections import defaultdict
+          from pathlib import Path
+
+          source = Path("year-1998.jsonl.zst")
+
+          catalogs = defaultdict(dict)
+          monthly = defaultdict(list)
+          id_text = {}
+          conflicts = set()
+          count = 0
+          sample = None
+
+          process = subprocess.Popen(
+              ["zstd", "-dc", str(source)],
+              stdout=subprocess.PIPE,
+              text=True,
+              encoding="utf-8"
+          )
+
+          for line in process.stdout:
+              item = json.loads(line)
+              count += 1
+
+              refs = {}
+              for topic, content in item["c"].items():
+                  ids = catalogs[topic]
+
+                  if content not in ids:
+                      ids[content] = len(ids)
+
+                  refs[topic] = ids[content]
+
+                  source_id = item["t"].get(topic)
+                  if source_id is not None:
+                      pair = (topic, source_id)
+                      if pair in id_text:
+                          if id_text[pair] != content:
+                              conflicts.add(pair)
+                      else:
+                          id_text[pair] = content
+
+              compact = {
+                  "k": item["k"],
+                  "ms": item.get("ms"),
+                  "t": item.get("t"),
+                  "r": refs
+              }
+
+              month = int(item["m"])
+              monthly[month].append(compact)
+
+              if item["k"] == "1998-01-01-0-male":
+                  sample = (item["c"], refs)
+
+          if process.wait() != 0:
+              raise RuntimeError("Decompression failed")
+
+          if count != 8760:
+              raise ValueError(
+                  f"Expected 8760 charts, got {count}"
+              )
+
+          def compressed_size(obj):
+              raw = json.dumps(
+                  obj, ensure_ascii=False,
+                  separators=(",", ":")
+              ).encode("utf-8")
+
+              result = subprocess.run(
+                  ["zstd", "-q", "-15", "-c"],
+                  input=raw,
+                  capture_output=True,
+                  check=True
+              )
+              return len(result.stdout)
+
+          text_lists = {}
+          dictionary_size = 0
+          largest_topic = 0
+
+          for topic, ids in catalogs.items():
+              texts = list(ids.keys())
+              text_lists[topic] = texts
+              size = compressed_size(texts)
+              dictionary_size += size
+              largest_topic = max(largest_topic, size)
+
+          month_size = sum(
+              compressed_size(rows)
+              for rows in monthly.values()
+          )
+
+          if sample is None:
+              raise ValueError("Test chart not found")
+
+          original, refs = sample
+          recovered = {
+              topic: text_lists[topic][idx]
+              for topic, idx in refs.items()
+          }
+
+          if recovered != original:
+              raise ValueError("Round-trip verification failed")
+
+          mb = lambda n: f"{n / 1048576:.2f}"
+
+          report = [
+              "# Ziwei 1998 Deduplication Report",
+              "",
+              f"Charts: {count}",
+              f"Topics: {len(catalogs)}",
+              f"Original annual zstd: {mb(source.stat().st_size)} MB",
+              f"Dictionary zstd total: {mb(dictionary_size)} MB",
+              f"Monthly index zstd total: {mb(month_size)} MB",
+              f"Combined size: {mb(dictionary_size + month_size)} MB",
+              f"Largest topic dictionary: {mb(largest_topic)} MB",
+              f"Source ID conflicts: {len(conflicts)}",
+              "Sample round-trip: PASS",
+              "",
+              "| Topic | Unique texts |",
+              "|---|---:|"
+          ]
+
+          for topic, ids in sorted(catalogs.items()):
+              report.append(f"| {topic} | {len(ids)} |")
+
+          report.append("")
+          report.append("No Cloudflare data was modified.")
+
+          output = "\n".join(report)
+          print(output)
+
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a", encoding="utf-8"
+          ) as f:
+              f.write(output + "\n")
+          PY
