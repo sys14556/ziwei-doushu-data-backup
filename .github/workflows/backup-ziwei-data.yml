@@ -1,0 +1,87 @@
+
+name: Backup Ziwei v4 Dataset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Download original dataset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dataset
+
+          gh release download v4.0-13d \
+            --repo Renhuai123/ziwei-doushu \
+            --dir dataset
+
+          curl -fLsS --retry 3 \
+            -o dataset/DATASET-LICENSE \
+            https://raw.githubusercontent.com/Renhuai123/ziwei-doushu/v4.0-13d/DATASET-LICENSE
+
+      - name: Verify downloaded files
+        shell: bash
+        run: |
+          set -e
+
+          count=$(find dataset -maxdepth 1 \
+            -name 'year-*.jsonl.zst' | wc -l)
+
+          echo "Year files: $count"
+          test "$count" -eq 77
+
+          test -s dataset/ziwei-interp-v4-all.tar
+          test -s dataset/MANIFEST.json
+          test -s dataset/DATASET-LICENSE
+
+          cd dataset
+          sha256sum -c SHA256SUMS.txt
+
+          if [ -f SHA256SUMS-all.txt ]; then
+            sha256sum -c SHA256SUMS-all.txt
+          fi
+
+          echo "Dataset verification completed."
+
+      - name: Create backup release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > backup-notes.md <<'EOF'
+          # Ziwei Doushu Dataset v4.0 Backup
+
+          Original project:
+          https://github.com/Renhuai123/ziwei-doushu
+
+          Original release: v4.0-13d
+          Published: 2026-10-15
+          Author: 王多鱼AI
+
+          Contents:
+          - 674,976 charts
+          - 13 interpretation topics
+          - Year files 1950-2026
+          - Complete compressed archive
+          - Manifest and SHA-256 checksums
+          - Original dataset license
+
+          Dataset license: CC BY 4.0.
+          Original Tian Ji quotations have
+          separate copyright restrictions.
+
+          This is an independent archival copy.
+          EOF
+
+          gh release create v4.0-13d-backup \
+            dataset/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Ziwei Dataset v4.0 Backup" \
+            --notes-file backup-notes.md
